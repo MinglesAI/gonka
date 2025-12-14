@@ -168,7 +168,7 @@ func (c *RewardRecoveryChecker) AutoRewardRecovery() {
 		"address", address)
 
 	// Perform validation recovery using the same logic as the admin endpoint
-	missedInferences, err := c.validator.DetectMissedValidations(epochIndex, seedValue)
+	missedInferences, err := c.validator.DetectMissedValidations(epochIndex, seedValue, false)
 	if err != nil {
 		logging.Error("[AutoRewardRecovery] Failed to detect missed validations during startup", types.Claims,
 			"epochIndex", epochIndex,

@@ -160,31 +160,37 @@ func (s *InferenceValidator) getCurrentSupportedModels() (map[string]bool, error
 
 // DetectMissedValidations identifies which validations were missed for a specific epoch
 // Returns a list of inference objects that the current participant should have validated but didn't
-func (s *InferenceValidator) DetectMissedValidations(epochIndex uint64, seed int64) ([]types.Inference, error) {
-	logging.Info("Starting missed validation detection", types.ValidationRecovery, "epochIndex", epochIndex, "seed", seed)
+func (s *InferenceValidator) DetectMissedValidations(epochIndex uint64, seed int64, forceValidateAll bool) ([]types.Inference, error) {
+	logging.Info("Starting missed validation detection", types.ValidationRecovery, "epochIndex", epochIndex, "seed", seed, "forceValidateAll", forceValidateAll)
 
 	queryClient := s.recorder.NewInferenceQueryClient()
 	address := s.recorder.GetAddress()
 
-	// Get all inferences (automatically pruned to recent 2-3 epochs) with pagination
-	var allInferences []types.Inference
+	// Get all InferenceValidationDetails (this is the same source that blockchain uses)
+	// This ensures we see ALL inferences, not just the pruned ones from InferenceAll
+	var allValidationDetails []types.InferenceValidationDetails
 	var nextKey []byte
 
 	for {
-		req := &types.QueryAllInferenceRequest{
+		req := &types.QueryAllInferenceValidationDetailsRequest{
 			Pagination: &query.PageRequest{
 				Key:   nextKey,
 				Limit: 1000, // Use larger page size for efficiency
 			},
 		}
 
-		resp, err := queryClient.InferenceAll(s.recorder.GetContext(), req)
+		resp, err := queryClient.InferenceValidationDetailsAll(s.recorder.GetContext(), req)
 		if err != nil {
-			logging.Error("Failed to query inferences page", types.ValidationRecovery, "error", err)
-			return nil, fmt.Errorf("failed to query inferences: %w", err)
+			logging.Error("Failed to query inference validation details page", types.ValidationRecovery, "error", err)
+			return nil, fmt.Errorf("failed to query inference validation details: %w", err)
 		}
 
-		allInferences = append(allInferences, resp.Inference...)
+		// Filter by epoch - only keep details for the target epoch
+		for _, detail := range resp.InferenceValidationDetails {
+			if detail.EpochId == epochIndex {
+				allValidationDetails = append(allValidationDetails, detail)
+			}
+		}
 
 		// Check if there are more pages
 		if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
@@ -193,78 +199,92 @@ func (s *InferenceValidator) DetectMissedValidations(epochIndex uint64, seed int
 		nextKey = resp.Pagination.NextKey
 	}
 
-	logging.Debug("Retrieved all inferences", types.ValidationRecovery, "totalCount", len(allInferences))
+	logging.Info("Retrieved all inference validation details for epoch", types.ValidationRecovery, "epochIndex", epochIndex, "totalCount", len(allValidationDetails))
 
-	// Filter inferences by epoch
-	var epochInferences []types.Inference
-	for _, inf := range allInferences {
-		if inf.EpochId == epochIndex {
-			epochInferences = append(epochInferences, inf)
-		}
-	}
-
-	if len(epochInferences) == 0 {
-		logging.Info("No inferences found for epoch", types.ValidationRecovery, "epochIndex", epochIndex)
+	if len(allValidationDetails) == 0 {
+		logging.Info("No inference validation details found for epoch", types.ValidationRecovery, "epochIndex", epochIndex)
 		return []types.Inference{}, nil
 	}
 
-	logging.Info("Found inferences for epoch", types.ValidationRecovery, "epochIndex", epochIndex, "count", len(epochInferences))
-
-	// Create a map for quick lookup of inferences by ID
-	inferenceMap := make(map[string]types.Inference)
-	inferenceIds := make([]string, len(epochInferences))
-	for i, inf := range epochInferences {
-		inferenceIds[i] = inf.InferenceId
-		inferenceMap[inf.InferenceId] = inf
+	// Extract inference IDs and create a map
+	inferenceIds := make([]string, len(allValidationDetails))
+	validationDetailsMap := make(map[string]*types.InferenceValidationDetails)
+	for i := range allValidationDetails {
+		detail := &allValidationDetails[i]
+		inferenceIds[i] = detail.InferenceId
+		validationDetailsMap[detail.InferenceId] = detail
 	}
 
-	// Process inference IDs in batches to avoid "request body too large" errors
-	const batchSize = 1000 // Reasonable batch size to stay under request limits
-	var allValidationDetails []*types.InferenceValidationDetails
-	var validatorPower uint64
+	logging.Info("Found inference validation details for epoch", types.ValidationRecovery, "epochIndex", epochIndex, "count", len(allValidationDetails))
 
-	for i := 0; i < len(inferenceIds); i += batchSize {
-		end := i + batchSize
+	// Get Inference objects for these IDs (needed for validation execution)
+	// We'll fetch them in batches to avoid overwhelming the query
+	inferenceMap := make(map[string]types.Inference)
+	const inferenceBatchSize = 100
+	for i := 0; i < len(inferenceIds); i += inferenceBatchSize {
+		end := i + inferenceBatchSize
 		if end > len(inferenceIds) {
 			end = len(inferenceIds)
 		}
-
 		batch := inferenceIds[i:end]
-		logging.Debug("Processing validation parameters batch", types.ValidationRecovery,
-			"batchNumber", (i/batchSize)+1,
-			"batchSize", len(batch),
-			"totalBatches", (len(inferenceIds)+batchSize-1)/batchSize)
 
-		batchResp, err := queryClient.GetInferenceValidationParameters(s.recorder.GetContext(), &types.QueryGetInferenceValidationParametersRequest{
-			Ids:       batch,
-			Requester: address,
-		})
-		if err != nil {
-			logging.Error("Failed to get validation parameters for batch", types.ValidationRecovery,
-				"batchNumber", (i/batchSize)+1,
-				"batchSize", len(batch),
-				"error", err)
-			return nil, fmt.Errorf("failed to get validation parameters for batch %d: %w", (i/batchSize)+1, err)
+		// Fetch Inference objects for this batch
+		for _, inferenceId := range batch {
+			infResp, err := queryClient.Inference(s.recorder.GetContext(), &types.QueryGetInferenceRequest{Index: inferenceId})
+			if err != nil {
+				logging.Warn("Failed to get inference object", types.ValidationRecovery, "inferenceId", inferenceId, "error", err)
+				continue
+			}
+			inferenceMap[inferenceId] = infResp.Inference
 		}
+	}
 
-		allValidationDetails = append(allValidationDetails, batchResp.Details...)
+	logging.Info("Retrieved inference objects", types.ValidationRecovery, "count", len(inferenceMap), "totalDetails", len(allValidationDetails))
 
-		// Capture ValidatorPower from the first batch (it should be the same across all batches)
-		if i == 0 {
+	// Get ValidatorPower - we need it for ShouldValidate calculation
+	// Skip if forceValidateAll is true (we don't need shouldValidate check)
+	var validatorPower uint64
+	if !forceValidateAll {
+		if len(inferenceIds) > 0 {
+			// Get ValidatorPower from first inference (or use a small batch)
+			batchSize := 10
+			if len(inferenceIds) < batchSize {
+				batchSize = len(inferenceIds)
+			}
+			firstBatch := inferenceIds[:batchSize]
+			
+			logging.Info("Getting ValidatorPower", types.ValidationRecovery,
+				"batchSize", batchSize, "totalInferenceIds", len(inferenceIds), "firstInferenceId", firstBatch[0])
+			
+			batchResp, err := queryClient.GetInferenceValidationParameters(s.recorder.GetContext(), &types.QueryGetInferenceValidationParametersRequest{
+				Ids:       firstBatch,
+				Requester: address,
+			})
+			if err != nil {
+				logging.Error("Failed to get validation parameters for ValidatorPower", types.ValidationRecovery, "error", err)
+				return nil, fmt.Errorf("failed to get validation parameters for ValidatorPower: %w", err)
+			}
 			validatorPower = batchResp.ValidatorPower
+			logging.Info("Retrieved ValidatorPower", types.ValidationRecovery, "validatorPower", validatorPower)
+			
+			if validatorPower == 0 {
+				logging.Error("ValidatorPower is 0 - this will cause all shouldValidate=false!", types.ValidationRecovery,
+					"epochIndex", epochIndex, "address", address)
+				return nil, fmt.Errorf("validatorPower is 0 for epoch %d and participant %s - cannot determine missed validations", epochIndex, address)
+			}
+		} else {
+			logging.Error("No inference IDs to get ValidatorPower", types.ValidationRecovery, "epochIndex", epochIndex)
+			return nil, fmt.Errorf("no inference IDs available for epoch %d", epochIndex)
 		}
+	} else {
+		logging.Info("Skipping ValidatorPower retrieval (forceValidateAll=true)", types.ValidationRecovery)
 	}
 
-	// Create a combined response structure
-	validationParamsResp := &types.QueryGetInferenceValidationParametersResponse{
-		Details:        allValidationDetails,
-		ValidatorPower: validatorPower,
+	// Convert allValidationDetails to pointers for compatibility with existing code
+	validationDetailsPtrs := make([]*types.InferenceValidationDetails, len(allValidationDetails))
+	for i := range allValidationDetails {
+		validationDetailsPtrs[i] = &allValidationDetails[i]
 	}
-
-	logging.Info("Completed batched validation parameter queries", types.ValidationRecovery,
-		"totalInferences", len(inferenceIds),
-		"totalBatches", (len(inferenceIds)+batchSize-1)/batchSize,
-		"retrievedDetails", len(allValidationDetails))
 
 	// Get validation params
 	params, err := queryClient.Params(s.recorder.GetContext(), &types.QueryParamsRequest{})
@@ -300,16 +320,33 @@ func (s *InferenceValidator) DetectMissedValidations(epochIndex uint64, seed int
 
 	// Check each inference to see if it should have been validated but wasn't
 	var missedValidations []types.Inference
-	for _, inferenceDetails := range validationParamsResp.Details {
+	for _, inferenceDetails := range validationDetailsPtrs {
 		if !supportedModels[inferenceDetails.Model] {
 			logging.Debug("Skipping inference - model not supported by any node", types.ValidationRecovery, "inferenceId", inferenceDetails.InferenceId, "model", inferenceDetails.Model)
 			continue
 		}
+		
+		// Skip if already validated
+		if alreadyValidated[inferenceDetails.InferenceId] {
+			continue
+		}
+		
+		// If forceValidateAll is true, skip shouldValidate check and add all non-validated inferences
+		if forceValidateAll {
+			if inference, exists := inferenceMap[inferenceDetails.InferenceId]; exists {
+				missedValidations = append(missedValidations, inference)
+				logging.Info("Found missed validation (force validate all)", types.ValidationRecovery, "inferenceId", inferenceDetails.InferenceId)
+			} else {
+				logging.Warn("Inference not found in map", types.ValidationRecovery, "inferenceId", inferenceDetails.InferenceId)
+			}
+			continue
+		}
+		
 		// Check if this participant should validate this inference
 		shouldValidate, message := s.shouldValidateInference(
 			inferenceDetails,
 			seed,
-			validationParamsResp.ValidatorPower,
+			validatorPower,
 			address,
 			params.Params.ValidationParams)
 
@@ -320,7 +357,7 @@ func (s *InferenceValidator) DetectMissedValidations(epochIndex uint64, seed int
 			"alreadyValidated", alreadyValidated[inferenceDetails.InferenceId])
 
 		// If should validate but didn't, add to missed list
-		if shouldValidate && !alreadyValidated[inferenceDetails.InferenceId] {
+		if shouldValidate {
 			if inference, exists := inferenceMap[inferenceDetails.InferenceId]; exists {
 				missedValidations = append(missedValidations, inference)
 				logging.Info("Found missed validation", types.ValidationRecovery, "inferenceId", inferenceDetails.InferenceId)
@@ -332,7 +369,250 @@ func (s *InferenceValidator) DetectMissedValidations(epochIndex uint64, seed int
 
 	logging.Info("Missed validation detection complete", types.ValidationRecovery,
 		"epochIndex", epochIndex,
-		"totalInferences", len(epochInferences),
+		"totalInferenceDetails", len(allValidationDetails),
+		"missedValidations", len(missedValidations))
+
+	return missedValidations, nil
+}
+
+// DetectMissedValidationsUsingBlockchainLogic uses the same logic as getMustBeValidatedInferences from blockchain
+// to determine which inferences should have been validated, then returns only those that were not validated
+func (s *InferenceValidator) DetectMissedValidationsUsingBlockchainLogic(epochIndex uint64, seed int64) ([]types.Inference, error) {
+	logging.Info("Starting missed validation detection using blockchain logic", types.ValidationRecovery, "epochIndex", epochIndex, "seed", seed)
+
+	queryClient := s.recorder.NewInferenceQueryClient()
+	address := s.recorder.GetAddress()
+
+	// Get main epoch group data
+	mainEpochDataResp, err := s.nodeBroker.GetChainBridge().GetEpochGroupDataByModelId(epochIndex, "")
+	if err != nil {
+		logging.Error("Failed to get main epoch group data", types.ValidationRecovery, "error", err)
+		return nil, fmt.Errorf("failed to get main epoch group data: %w", err)
+	}
+	if mainEpochDataResp == nil {
+		return nil, fmt.Errorf("main epoch group data response is nil for epoch %d", epochIndex)
+	}
+
+	mainEpochData := mainEpochDataResp.EpochGroupData
+
+	// Build weight map for main model
+	mainWeightMap := make(map[string]*types.ValidationWeight)
+	mainTotalWeight := int64(0)
+	for _, weight := range mainEpochData.ValidationWeights {
+		if weight == nil {
+			continue
+		}
+		mainTotalWeight += weight.Weight
+		mainWeightMap[weight.MemberAddress] = weight
+	}
+
+	// Check if validator is in the main weight map
+	_, found := mainWeightMap[address]
+	if !found {
+		logging.Error("Validator not found in main weight map", types.ValidationRecovery, "validator", address, "epochIndex", epochIndex)
+		return nil, fmt.Errorf("validator %s not found in main weight map for epoch %d", address, epochIndex)
+	}
+
+	// Create maps to store weight maps for each model
+	modelWeightMaps := make(map[string]map[string]*types.ValidationWeight)
+	modelTotalWeights := make(map[string]int64)
+
+	// Store main model data
+	modelWeightMaps[""] = mainWeightMap
+	modelTotalWeights[""] = mainTotalWeight
+
+	// Get sub models from the main epoch data
+	for _, subModelId := range mainEpochData.SubGroupModels {
+		subEpochDataResp, err := s.nodeBroker.GetChainBridge().GetEpochGroupDataByModelId(epochIndex, subModelId)
+		if err != nil {
+			logging.Warn("Sub epoch data not found", types.ValidationRecovery, "epoch", epochIndex, "modelId", subModelId, "error", err)
+			continue
+		}
+		if subEpochDataResp == nil {
+			logging.Warn("Sub epoch data response is nil", types.ValidationRecovery, "epoch", epochIndex, "modelId", subModelId)
+			continue
+		}
+
+		subEpochData := subEpochDataResp.EpochGroupData
+		subWeightMap := make(map[string]*types.ValidationWeight)
+		subTotalWeight := int64(0)
+		for _, weight := range subEpochData.ValidationWeights {
+			if weight == nil {
+				continue
+			}
+			subTotalWeight += weight.Weight
+			subWeightMap[weight.MemberAddress] = weight
+		}
+
+		modelWeightMaps[subModelId] = subWeightMap
+		modelTotalWeights[subModelId] = subTotalWeight
+	}
+
+	// Get all InferenceValidationDetails for the epoch
+	var allValidationDetails []types.InferenceValidationDetails
+	var nextKey []byte
+
+	for {
+		req := &types.QueryAllInferenceValidationDetailsRequest{
+			Pagination: &query.PageRequest{
+				Key:   nextKey,
+				Limit: 1000,
+			},
+		}
+
+		resp, err := queryClient.InferenceValidationDetailsAll(s.recorder.GetContext(), req)
+		if err != nil {
+			logging.Error("Failed to query inference validation details page", types.ValidationRecovery, "error", err)
+			return nil, fmt.Errorf("failed to query inference validation details: %w", err)
+		}
+
+		// Filter by epoch
+		for _, detail := range resp.InferenceValidationDetails {
+			if detail.EpochId == epochIndex {
+				allValidationDetails = append(allValidationDetails, detail)
+			}
+		}
+
+		if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
+			break
+		}
+		nextKey = resp.Pagination.NextKey
+	}
+
+	logging.Info("Retrieved all inference validation details for epoch", types.ValidationRecovery, "epochIndex", epochIndex, "totalCount", len(allValidationDetails))
+
+	// Get validation params
+	params, err := queryClient.Params(s.recorder.GetContext(), &types.QueryParamsRequest{})
+	if err != nil {
+		logging.Error("Failed to get params", types.ValidationRecovery, "error", err)
+		return nil, fmt.Errorf("failed to get params: %w", err)
+	}
+
+	// Get what validations were already submitted
+	epochGroupValidationsResp, err := queryClient.EpochGroupValidations(s.recorder.GetContext(), &types.QueryGetEpochGroupValidationsRequest{
+		Participant: address,
+		EpochIndex:  epochIndex,
+	})
+
+	alreadyValidated := make(map[string]bool)
+	if err == nil {
+		for _, inferenceId := range epochGroupValidationsResp.EpochGroupValidations.ValidatedInferences {
+			alreadyValidated[inferenceId] = true
+		}
+	} else {
+		if status.Code(err) == codes.NotFound {
+			logging.Info("No epoch group validations found", types.ValidationRecovery, "participant", address, "epochIndex", epochIndex)
+		} else {
+			logging.Warn("Failed to get epoch group validations", types.ValidationRecovery, "error", err, "participant", address, "epochIndex", epochIndex)
+		}
+	}
+
+	// Determine which inferences must be validated (using blockchain logic)
+	mustBeValidatedIds := make([]string, 0)
+
+	for _, inferenceDetails := range allValidationDetails {
+		// Skip if executor is the validator
+		if inferenceDetails.ExecutorId == address {
+			continue
+		}
+
+		// Determine which model this inference belongs to
+		modelId := inferenceDetails.Model
+		weightMap, exists := modelWeightMaps[modelId]
+		if !exists {
+			logging.Warn("Model not found in weight maps", types.ValidationRecovery, "modelId", modelId, "inferenceId", inferenceDetails.InferenceId)
+			continue
+		}
+
+		// Check if validator is in the weight map for this model
+		validatorPowerForModel, found := weightMap[address]
+		if !found {
+			logging.Debug("Validator not found in weight map for model", types.ValidationRecovery, "validator", address, "model", modelId)
+			continue
+		}
+		if validatorPowerForModel == nil {
+			logging.Warn("ValidatorPowerForModel is nil", types.ValidationRecovery, "validator", address, "model", modelId)
+			continue
+		}
+
+		// Check if executor is in the weight map for this model
+		executorPower, found := weightMap[inferenceDetails.ExecutorId]
+		if !found {
+			logging.Warn("Executor not found in weight map", types.ValidationRecovery, "executor", inferenceDetails.ExecutorId, "model", modelId)
+			continue
+		}
+
+		// Get the total weight for this model
+		totalWeight := modelTotalWeights[modelId]
+
+		// Check ShouldValidate using blockchain logic
+		shouldValidate, _ := calculations.ShouldValidate(
+			seed,
+			&inferenceDetails,
+			uint32(totalWeight),
+			uint32(validatorPowerForModel.Weight),
+			uint32(executorPower.Weight),
+			params.Params.ValidationParams)
+
+		if shouldValidate {
+			mustBeValidatedIds = append(mustBeValidatedIds, inferenceDetails.InferenceId)
+		}
+	}
+
+	logging.Info("Must be validated inferences (blockchain logic)", types.ValidationRecovery,
+		"count", len(mustBeValidatedIds),
+		"total", len(allValidationDetails))
+
+	// Find which ones were not validated
+	missedInferenceIds := make([]string, 0)
+	for _, inferenceId := range mustBeValidatedIds {
+		if !alreadyValidated[inferenceId] {
+			missedInferenceIds = append(missedInferenceIds, inferenceId)
+		}
+	}
+
+	logging.Info("Missed validations (blockchain logic)", types.ValidationRecovery,
+		"mustBeValidated", len(mustBeValidatedIds),
+		"alreadyValidated", len(alreadyValidated),
+		"missed", len(missedInferenceIds))
+
+	// Early return if no missed validations
+	if len(missedInferenceIds) == 0 {
+		logging.Info("No missed validations found (blockchain logic)", types.ValidationRecovery, "epochIndex", epochIndex)
+		return []types.Inference{}, nil
+	}
+
+	// Get Inference objects for missed validations
+	inferenceMap := make(map[string]types.Inference)
+	const inferenceBatchSize = 100
+	for i := 0; i < len(missedInferenceIds); i += inferenceBatchSize {
+		end := i + inferenceBatchSize
+		if end > len(missedInferenceIds) {
+			end = len(missedInferenceIds)
+		}
+		batch := missedInferenceIds[i:end]
+
+		for _, inferenceId := range batch {
+			infResp, err := queryClient.Inference(s.recorder.GetContext(), &types.QueryGetInferenceRequest{Index: inferenceId})
+			if err != nil {
+				logging.Warn("Failed to get inference object", types.ValidationRecovery, "inferenceId", inferenceId, "error", err)
+				continue
+			}
+			inferenceMap[inferenceId] = infResp.Inference
+		}
+	}
+
+	// Build result list
+	missedValidations := make([]types.Inference, 0, len(missedInferenceIds))
+	for _, inferenceId := range missedInferenceIds {
+		if inference, exists := inferenceMap[inferenceId]; exists {
+			missedValidations = append(missedValidations, inference)
+		}
+	}
+
+	logging.Info("Missed validation detection complete (blockchain logic)", types.ValidationRecovery,
+		"epochIndex", epochIndex,
+		"mustBeValidated", len(mustBeValidatedIds),
 		"missedValidations", len(missedValidations))
 
 	return missedValidations, nil

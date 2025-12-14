@@ -593,7 +593,7 @@ func (d *OnNewBlockDispatcher) executeMissedValidationRecoveryWithSeed(previousE
 		"seed", previousSeed.Seed)
 
 	// Detect missed validations for the previous epoch
-	missedInferences, err := d.validator.DetectMissedValidations(previousEpochIndex, previousSeed.Seed)
+	missedInferences, err := d.validator.DetectMissedValidations(previousEpochIndex, previousSeed.Seed, false)
 	if err != nil {
 		logging.Error("Failed to detect missed validations", types.ValidationRecovery,
 			"previousEpochIndex", previousEpochIndex,
