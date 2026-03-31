@@ -85,8 +85,12 @@ type CircuitBreakerEntry struct {
 	ProbeAttempts    int32   `json:"probe_attempts"`
 	// LastRestoredBlock is the block height at which a probe succeeded and the node was
 	// restored to HEALTHY. UpdateCBStateForBlock Pass 2 skips nodes where
-	// blockHeight == LastRestoredBlock to prevent same-block re-exclusion.
-	LastRestoredBlock int64  `json:"last_restored_block,omitempty"`
+	// ProbeRestored == true && blockHeight == LastRestoredBlock (one-block grace period).
+	LastRestoredBlock int64 `json:"last_restored_block,omitempty"`
+	// ProbeRestored is true when the node was just restored from a probe success.
+	// This flag gates the grace-period check to avoid false positives when both
+	// LastRestoredBlock and blockHeight are zero (e.g. in tests or genesis block).
+	ProbeRestored bool `json:"probe_restored,omitempty"`
 }
 
 // cbStoreKey returns the raw byte key used to store a CB entry for an address.
@@ -275,7 +279,9 @@ func (k Keeper) UpdateCBStateForBlock(ctx context.Context, blockHeight int64) {
 		// Grace period: skip nodes that were just restored to HEALTHY by a probe success
 		// in this same block. Without this, EndBlock Pass 2 would immediately re-exclude
 		// them based on stale miss-rate stats before any new inference data has arrived.
-		if existing.LastRestoredBlock == blockHeight {
+		// ProbeRestored guards against false positives when LastRestoredBlock and
+		// blockHeight are both zero (default value for nodes never in a probe cycle).
+		if existing.ProbeRestored && existing.LastRestoredBlock == blockHeight {
 			continue
 		}
 
@@ -311,6 +317,7 @@ func (k Keeper) RecordCBResult(ctx context.Context, address string, blockHeight 
 			"address", address, "blockHeight", blockHeight)
 		entry.State = CBStateHealthy
 		entry.LastRestoredBlock = blockHeight
+		entry.ProbeRestored = true
 		k.SetCBEntry(ctx, entry)
 	} else {
 		// Probe failed — re-exclude with doubled cooldown

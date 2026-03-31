@@ -119,11 +119,12 @@ func TestRecordCBResult_ProbeSuccess(t *testing.T) {
 
 	k.RecordCBResult(ctx, cbAddr1, 155, true)
 
-	// Entry is kept in the store with State=HEALTHY and LastRestoredBlock set
-	// (no longer deleted) so that EndBlock can apply the one-block grace period.
+	// Entry is kept in the store with State=HEALTHY, LastRestoredBlock set, and
+	// ProbeRestored=true so that EndBlock can apply the one-block grace period.
 	entry := k.GetCBEntry(ctx, cbAddr1)
 	require.Equal(t, keeperpkg.CBStateHealthy, entry.State)
 	require.Equal(t, int64(155), entry.LastRestoredBlock, "LastRestoredBlock should record the recovery block")
+	require.True(t, entry.ProbeRestored, "ProbeRestored should be true after probe success")
 }
 
 // TestRecordCBResult_ProbeFailure verifies PROBE → EXCLUDED (doubled cooldown) on miss.

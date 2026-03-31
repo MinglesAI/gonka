@@ -182,10 +182,11 @@ func TestProbeSuccessNotReExcludedSameBlock(t *testing.T) {
 	// Probe succeeds in this block (e.g., FinishInference → RecordCBResult)
 	k.RecordCBResult(ctx, cbAddr1, blockHeight, true)
 
-	// Verify node is now HEALTHY with LastRestoredBlock set
+	// Verify node is now HEALTHY with LastRestoredBlock set and ProbeRestored flagged
 	entry := k.GetCBEntry(ctx, cbAddr1)
 	require.Equal(t, keeperpkg.CBStateHealthy, entry.State, "probe success should restore node to HEALTHY")
 	require.Equal(t, blockHeight, entry.LastRestoredBlock, "LastRestoredBlock should be set to current block")
+	require.True(t, entry.ProbeRestored, "ProbeRestored should be true after probe success")
 
 	// EndBlock Pass 2 runs in the SAME block — node should survive re-exclusion check
 	k.UpdateCBStateForBlock(ctx, blockHeight)
