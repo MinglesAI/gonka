@@ -75,7 +75,12 @@ func (eg *EpochGroup) GetRandomMember(
 // PoC voting weights (ValidationWeights[].Weight) and the cosmos-sdk group member
 // weights (used for block production) are NOT modified; this map is used solely by
 // the executor-selection lottery.
+//
+// Returns an empty map if GroupData or ValidationWeights is nil.
 func (eg *EpochGroup) buildSelectionWeightsMap() map[string]int64 {
+	if eg.GroupData == nil {
+		return make(map[string]int64)
+	}
 	weights := make(map[string]int64, len(eg.GroupData.ValidationWeights))
 	for _, vw := range eg.GroupData.ValidationWeights {
 		if vw == nil {

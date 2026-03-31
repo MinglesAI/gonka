@@ -48,6 +48,15 @@ type cbParams struct {
 
 // getCBParams reads CB parameters from ValidationParams and falls back to Go
 // compile-time defaults for any field that is zero (unset).
+//
+// NOTE: Zero-value governance override caveat — because zero is used as a sentinel
+// for "unset" (triggering the default fallback), it is not possible to set any of
+// these parameters to 0 via a governance proposal. For example, setting
+// CbMissThresholdPct=0 to disable threshold-based exclusion will be silently
+// ignored and the default (DefaultCBMissThresholdPct=25) will be used instead.
+// This is intentional: a threshold of 0 would immediately exclude every node.
+// If disabling the circuit breaker is needed, prefer very large values
+// (e.g. CbMissThresholdPct=100 or CbMinSamples=MaxUint64) rather than zero.
 func (k Keeper) getCBParams(ctx context.Context) cbParams {
 	p := cbParams{
 		MissThresholdPct:      DefaultCBMissThresholdPct,
