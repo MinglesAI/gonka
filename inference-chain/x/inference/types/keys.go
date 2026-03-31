@@ -75,9 +75,11 @@ var (
 	SubnetEscrowCounterPrefix              = collections.NewPrefix(49)
 	SubnetEscrowEpochCountPrefix           = collections.NewPrefix(50)
 	SubnetHostEpochStatsPrefix             = collections.NewPrefix(51)
-	SubnetEscrowsByEpochPrefix             = collections.NewPrefix(52)
-	CircuitBreakerStatePrefix              = collections.NewPrefix(53)
-	ParamsKey                              = []byte("p_inference")
+	SubnetEscrowsByEpochPrefix = collections.NewPrefix(52)
+	// Note: prefix 53 is reserved for circuit breaker state; the implementation uses
+	// the string-based CircuitBreakerStateKey with KeyPrefix() for consistency with
+	// other string-keyed stores in this module. Do not reuse prefix 53.
+	ParamsKey = []byte("p_inference")
 )
 
 func KeyPrefix(p string) []byte {
